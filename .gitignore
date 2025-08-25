@@ -1,0 +1,15 @@
+# Node / React
+frontend/node_modules
+frontend/dist
+
+# Python / Flask
+backend/.venv
+backend/__pycache__/
+backend/*.pyc
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# Env files
+*.env
