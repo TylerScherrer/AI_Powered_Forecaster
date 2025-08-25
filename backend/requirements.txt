@@ -6,3 +6,4 @@ numpy
 scikit-learn
 joblib
 xgboost
+azure-storage-blob

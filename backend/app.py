@@ -1,297 +1,215 @@
-# backend/app.py
-from __future__ import annotations
-
 import os
-import re
-from pathlib import Path
-from typing import Dict, List, Tuple
+import json
+from io import BytesIO
+from typing import Optional
 
-import joblib
-import pandas as pd
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+import pandas as pd
+import joblib
 
+# Optional import; only needed when using blob storage
+try:
+    from azure.storage.blob import BlobClient
+    HAS_AZURE = True
+except Exception:
+    HAS_AZURE = False
 
+# --------------------------
+# Helpers: Blob download
+# --------------------------
+def download_blob_bytes(
+    *,
+    blob_url: Optional[str] = None,
+    account_url: Optional[str] = None,
+    container: Optional[str] = None,
+    blob_name: Optional[str] = None,
+    sas_token: Optional[str] = None,
+    connection_string: Optional[str] = None,
+) -> bytes:
+    """
+    Download a blob's content as bytes.
+    Supports:
+      - full blob_url with SAS embedded
+      - account_url + container + blob + sas_token
+      - connection_string + container + blob
+    """
+    if not HAS_AZURE:
+        raise RuntimeError("azure-storage-blob not installed")
+
+    if blob_url:
+        # If blob_url already includes ?sv=..., no credential needed
+        client = BlobClient.from_blob_url(blob_url)
+    elif connection_string:
+        if not (container and blob_name):
+            raise ValueError("container and blob_name required with connection_string")
+        client = BlobClient.from_connection_string(
+            conn_str=connection_string,
+            container_name=container,
+            blob_name=blob_name,
+        )
+    else:
+        if not (account_url and container and blob_name and sas_token):
+            raise ValueError("account_url, container, blob_name, sas_token are required")
+        client = BlobClient(
+            account_url=account_url,
+            container_name=container,
+            blob_name=blob_name,
+            credential=sas_token,
+        )
+
+    stream = client.download_blob()
+    return stream.readall()
+
+# --------------------------
+# App Factory
+# --------------------------
 def create_app() -> Flask:
     app = Flask(__name__)
+    CORS(app)
 
-    # ---- CORS --------------------------------------------------------------
-    default_origins = [
-        "http://localhost:5173",
-        "https://localhost:5173",
-        "https://proud-plant-085ec8d0f.2.azurestaticapps.net",  # your SWA
-    ]
-    extra = os.getenv("ALLOWED_ORIGINS", "")
-    allowed_origins = default_origins + [o.strip() for o in extra.split(",") if o.strip()]
-    CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
+    app.config["MODEL"] = None
+    app.config["FEATURES_DF"] = None
+    app.config["STATUS"] = "init"
+    app.config["LAST_ERROR"] = None
 
-    # ---- Paths & mutable state ---------------------------------------------
-    BASE_DIR = Path(__file__).resolve().parent
-    DEFAULT_MODEL = BASE_DIR / "models" / "model.joblib"
-    DEFAULT_FEATURES = BASE_DIR / "data" / "features.csv"
-    DEFAULT_STORES = BASE_DIR / "data" / "stores.csv"
+    # Local paths (dev)
+    local_model_path = os.getenv("MODEL_PATH", os.getenv("MODEL_FILE", "backend/models/model.pkl"))
+    local_features_path = os.getenv("FEATURES_PATH", os.getenv("FEATURES_FILE", "backend/data/features.csv"))
 
-    MODEL_PATH = Path(os.getenv("MODEL_PATH", DEFAULT_MODEL))
-    FEATURES_PATH = Path(os.getenv("FEATURES_CSV", DEFAULT_FEATURES))
-    STORES_PATH = Path(os.getenv("STORES_CSV", DEFAULT_STORES))
-    # If your store column in features.csv has a specific name, set STORE_COLUMN.
-    # e.g. STORE_COLUMN=Number  (case-insensitive match)
-    STORE_COLUMN = os.getenv("STORE_COLUMN", "")
+    # Blob (Option A: SAS)
+    blob_base_url = os.getenv("BLOB_BASE_URL")  # e.g., https://...blob.core.windows.net/artifacts
+    blob_sas = os.getenv("BLOB_SAS")            # just the query string (no leading '?')
+    model_blob = os.getenv("MODEL_BLOB", "model.pkl")
+    features_blob = os.getenv("FEATURES_BLOB", "features.csv")
 
-    state: Dict[str, object] = {
-        "model": None,
-        "feature_names": [],
-        "stores": [],
-        "last_error": None,
-        "model_path": str(MODEL_PATH),
-        "features_path": str(FEATURES_PATH),
-        "stores_path": str(STORES_PATH),
-        "store_source": None,
-    }
+    # Blob (Option B: Connection string)
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    blob_container = os.getenv("BLOB_CONTAINER")
 
-    # ---- Helpers ------------------------------------------------------------
+    def load_artifacts():
+        # Try local first (keeps your current local workflow working)
+        if os.path.exists(local_model_path) and os.path.exists(local_features_path):
+            app.config["MODEL"] = joblib.load(local_model_path)
+            app.config["FEATURES_DF"] = pd.read_csv(local_features_path, low_memory=False)
+            app.config["STATUS"] = "ok"
+            app.config["LAST_ERROR"] = None
+            return
 
-    def _resolve_model_path(p: Path) -> Path:
-        if p.exists():
-            return p
-        alt = p.with_suffix(".pkl")
-        return alt if alt.exists() else p
+        # Else try Blob Storage
+        if not HAS_AZURE:
+            raise RuntimeError("azure-storage-blob not installed and local files not found")
 
-    def _load_features_csv(path: Path) -> List[str]:
-        """Accept either a single-column list OR a table (use headers; drop common targets)."""
-        df = pd.read_csv(path)
-        if df.shape[1] == 1:
-            names = df.iloc[:, 0].dropna().astype(str).tolist()
+        # Build download approach
+        # Option B: connection string takes precedence if set
+        if conn_str and blob_container:
+            model_bytes = download_blob_bytes(
+                connection_string=conn_str,
+                container=blob_container,
+                blob_name=model_blob,
+            )
+            feat_bytes = download_blob_bytes(
+                connection_string=conn_str,
+                container=blob_container,
+                blob_name=features_blob,
+            )
         else:
-            banned = {"target", "label", "y"}
-            names = [c for c in df.columns if c.lower() not in banned]
-        if not names:
-            raise ValueError("No feature names found in features.csv")
-        return names
+            # Option A: base URL + SAS
+            if not (blob_base_url and blob_sas):
+                raise RuntimeError("Blob config missing (set BLOB_BASE_URL & BLOB_SAS or a connection string).")
+            # Compose full URLs (include '?' yourself)
+            model_url = f"{blob_base_url}/{model_blob}?{blob_sas}"
+            feat_url = f"{blob_base_url}/{features_blob}?{blob_sas}"
+            model_bytes = download_blob_bytes(blob_url=model_url)
+            feat_bytes = download_blob_bytes(blob_url=feat_url)
 
-    def _infer_stores_from_onehot(names: List[str]) -> List[dict]:
-        """Infer store ids from one-hot feature names like store_001 or store[T.002]."""
-        candidates: set[str] = set()
-        for n in names:
-            low = n.lower()
+        # Load artifacts into memory
+        app.config["MODEL"] = joblib.load(BytesIO(model_bytes))
+        app.config["FEATURES_DF"] = pd.read_csv(BytesIO(feat_bytes), low_memory=False)
+        app.config["STATUS"] = "ok"
+        app.config["LAST_ERROR"] = None
 
-            for pref in ("store_", "storeid_", "store_id_", "location_", "loc_", "shop_"):
-                if low.startswith(pref):
-                    suffix = n[len(pref) :].strip()
-                    suffix = suffix.replace("[T.", "").replace("]", "").replace("__", "_")
-                    if suffix:
-                        candidates.add(suffix)
+    # Try loading once at startup; if it fails, /api/health will report the error.
+    try:
+        load_artifacts()
+    except Exception as e:
+        app.config["STATUS"] = "init"
+        app.config["LAST_ERROR"] = str(e)
 
-            m = re.match(r"^(store|store_id|location|shop)[\s_\-]+(.+)$", low)
-            if m:
-                suffix = n[m.end(1) :].lstrip(" _-").replace("[T.", "").replace("]", "").strip()
-                if suffix:
-                    candidates.add(suffix)
-
-        if not candidates:
-            return []
-
-        def sort_key(x: str):
-            return (0, int(x)) if x.isdigit() else (1, x)
-
-        return [{"id": s, "name": f"Store {s}"} for s in sorted(candidates, key=sort_key)]
-
-    def _infer_stores_from_features_table(path: Path) -> List[dict]:
-        """
-        If features.csv is a TABLE, pull the distinct values from the store column.
-        Candidate column names are checked case-insensitively.
-        You can force a specific column via STORE_COLUMN env var.
-        """
-        df = pd.read_csv(path)
-        if df.empty:
-            return []
-
-        cols_lower = [c.lower().strip() for c in df.columns]
-
-        # explicit override
-        if STORE_COLUMN:
-            try_names = [STORE_COLUMN.lower().strip()]
-        else:
-            try_names = [
-                "store", "store_id", "storeid", "store number", "store_number",
-                "number", "location", "shop",
-            ]
-
-        col_name = None
-        for cand in try_names:
-            if cand in cols_lower:
-                col_name = df.columns[cols_lower.index(cand)]
-                break
-        if not col_name:
-            return []
-
-        values = pd.unique(df[col_name].dropna())
-        ids = [str(v) for v in values]
-
-        def sort_key(x: str):
-            return (0, int(x)) if x.isdigit() else (1, x)
-
-        return [{"id": s, "name": f"Store {s}"} for s in sorted(ids, key=sort_key)]
-
-    def _load_stores_csv(path: Path) -> List[dict]:
-        """Fallback: read stores from a separate CSV (id[,name] or store[,name])."""
-        df = pd.read_csv(path)
-        cols = [c.lower() for c in df.columns]
-        if "id" in cols:
-            id_col = df.columns[cols.index("id")]
-        elif "store" in cols:
-            id_col = df.columns[cols.index("store")]
-        else:
-            id_col = df.columns[0]
-        name_col = df.columns[cols.index("name")] if "name" in cols else None
-
-        out = []
-        for _, r in df.iterrows():
-            sid = str(r[id_col])
-            name = str(r[name_col]) if name_col else f"Store {sid}"
-            out.append({"id": sid, "name": name})
-        return out
-
-    def load_artifacts() -> None:
-        """Load model + features (+ stores) into memory."""
-        try:
-            mp = _resolve_model_path(MODEL_PATH)
-            model = joblib.load(mp)
-            feats = _load_features_csv(FEATURES_PATH)
-
-            stores = []
-            source = None
-
-            # 1) PREFER: pull stores from features.csv table (e.g., 'Number' column)
-            if FEATURES_PATH.exists():
-                tbl_stores = _infer_stores_from_features_table(FEATURES_PATH)
-                if tbl_stores:
-                    stores = tbl_stores
-                    source = "features_csv_column"
-
-            # 2) FALLBACK: infer from one-hot feature names if table didn’t work
-            if not stores:
-                oh_stores = _infer_stores_from_onehot(feats)
-                if oh_stores:
-                    stores = oh_stores
-                    source = "onehot_features"
-
-            # 3) LAST RESORT: separate stores.csv if present
-            if not stores and STORES_PATH.exists():
-                csv_stores = _load_stores_csv(STORES_PATH)
-                if csv_stores:
-                    stores = csv_stores
-                    source = "stores_csv"
-
-            state["model"] = model
-            state["feature_names"] = feats
-            state["stores"] = stores
-            state["store_source"] = source
-            state["model_path"] = str(mp)
-            state["last_error"] = None
-
-        except Exception as e:
-            state["model"] = None
-            state["feature_names"] = []
-            state["stores"] = []
-            state["store_source"] = None
-            state["last_error"] = str(e)
-
-    def _prepare_dataframe(payload: dict) -> Tuple[pd.DataFrame, bool]:
-        """
-        Accepts:
-          - {"data": {feat: value, ...}}
-          - {"rows": [ {feat: val}, {...} ]}
-          - Or a flat dict {feat: value}
-        """
-        data = payload.get("data", payload.get("row", payload))
-        rows = payload.get("rows")
-        feats: List[str] = state["feature_names"]
-
-        if rows and isinstance(rows, list):
-            df = pd.DataFrame(rows)
-            missing = [f for f in feats if f not in df.columns]
-            if missing:
-                raise KeyError(f"Missing features: {missing}")
-            df = df[feats]
-            return df, True
-        else:
-            if not isinstance(data, dict):
-                raise TypeError("Payload should be a JSON object or {data: {...}}")
-            missing = [f for f in feats if f not in data]
-            if missing:
-                raise KeyError(f"Missing features: {missing}")
-            row = [data[f] for f in feats]
-            df = pd.DataFrame([row], columns=feats)
-            return df, False
-
-    # ---- Load artifacts at startup -----------------------------------------
-    load_artifacts()
-
-    # ---- Routes -------------------------------------------------------------
-
-    @app.get("/api/health")
+    # --------------------------
+    # Routes
+    # --------------------------
+    @app.route("/api/health")
     def health():
-        ok = state["model"] is not None and len(state["feature_names"]) > 0
-        return jsonify(
-            status="ok" if ok else "init",
-            service="backend",
-            n_features=len(state["feature_names"]),
-            n_stores=len(state["stores"]),
-            model_path=state["model_path"],
-            features_path=state["features_path"],
-            stores_path=state["stores_path"],
-            store_source=state["store_source"],
-            last_error=state["last_error"],
-        )
+        df = app.config.get("FEATURES_DF")
+        return jsonify({
+            "service": "backend",
+            "status": app.config.get("STATUS"),
+            "last_error": app.config.get("LAST_ERROR"),
+            "n_features": int(df.shape[0]) if isinstance(df, pd.DataFrame) else 0,
+        })
 
-    @app.get("/api/features")
-    def features():
-        if not state["feature_names"]:
-            return jsonify(error="features_not_loaded", message=state["last_error"]), 500
-        return jsonify(features=state["feature_names"])
-
-    @app.get("/api/stores")
+    @app.route("/api/stores")
     def stores():
-        if state["stores"]:
-            return jsonify(stores=state["stores"], source=state["store_source"] or "inferred_or_csv")
-        # No stores found: give a helpful note
-        return jsonify(
-            stores=[],
-            source="unknown",
-            note=(
-                "No store list found. Set STORE_COLUMN env var (e.g. STORE_COLUMN=Number), "
-                "or provide backend/data/stores.csv"
-            ),
-        )
+        """
+        Returns list of stores. If a column named 'store' (case-insensitive) exists,
+        use its unique values. Otherwise, fall back to heuristics.
+        """
+        df = app.config.get("FEATURES_DF")
+        if not isinstance(df, pd.DataFrame):
+            return jsonify({"stores": [], "source": "none"})
 
-    @app.get("/api/hello")
-    def hello():
-        store = request.args.get("store")
-        msg = "Hello from backend!"
-        if store:
-            msg += f" (store={store})"
-        return jsonify(message=msg)
+        # Look for store-like column
+        store_col = None
+        for c in df.columns:
+            if c.lower() in ("store", "store_id", "store_number", "store_num"):
+                store_col = c
+                break
 
-    @app.post("/api/forecast")
+        if store_col:
+            values = sorted({str(v) for v in df[store_col].dropna().unique().tolist()})
+            return jsonify({
+                "source": f"blob:{store_col}",
+                "stores": [{"id": v, "name": f"Store {v}"} for v in values[:5000]]  # safety cap
+            })
+
+        # Fallback: previous heuristic
+        candidates = []
+        for c in df.columns:
+            if "store" in c.lower() or ("Number" in c and df[c].dtype != "O"):
+                candidates.append(c)
+        if candidates:
+            stores = [{"id": c, "name": c.replace("_", " ").title()} for c in candidates]
+            return jsonify({"source": "onehot_features", "stores": stores})
+
+        return jsonify({"source": "unknown", "stores": []})
+
+    @app.route("/api/forecast", methods=["POST"])
     def forecast():
-        if state["model"] is None or not state["feature_names"]:
-            return jsonify(error="model_not_loaded", message=state["last_error"]), 503
+        """
+        Example: expects JSON with whatever features your model needs.
+        This stub echoes back and ensures model is loaded.
+        """
+        if app.config.get("MODEL") is None:
+            # Attempt lazy-load if startup failed
+            try:
+                load_artifacts()
+            except Exception as e:
+                return jsonify({"error": f"Model not ready: {e}"}), 503
 
-        payload = request.get_json(force=True, silent=True) or {}
-        try:
-            X, _ = _prepare_dataframe(payload)
-            X = X.apply(pd.to_numeric, errors="ignore")
-            yhat = state["model"].predict(X)
-            preds = getattr(yhat, "tolist", lambda: yhat)()
-            return jsonify(predictions=preds, rows=len(preds))
-        except KeyError as e:
-            return jsonify(error="missing_features", message=str(e)), 400
-        except Exception as e:
-            return jsonify(error="prediction_failed", message=str(e)), 500
+        payload = request.get_json(silent=True) or {}
+        # TODO: transform payload -> feature vector(s) for your model
+        # pred = app.config["MODEL"].predict(...)
+        return jsonify({"ok": True, "received": payload})
+
+    @app.route("/")
+    def root():
+        return "Hello from backend!"
 
     return app
 
+app = create_app()
 
 if __name__ == "__main__":
-    create_app().run(host="127.0.0.1", port=5000, debug=True)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
