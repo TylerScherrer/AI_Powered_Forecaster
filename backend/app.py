@@ -229,8 +229,11 @@ def create_app() -> Flask:
                 return
 
             # Build store list if not already set
-            if not app.config.get("STORE_LIST_CACHE"):
-                app.config["STORE_LIST_CACHE"] = _build_store_cache(df, store_id_column=store_id_column)
+            # Build/override store list from CSV once it's loaded
+            computed = _build_store_cache(df, store_id_column=store_id_column)
+            if computed:
+                app.config["STORE_LIST_CACHE"] = computed
+
 
             app.config.update(MODEL=model, FEATURES_DF=df, STATUS="ok", LAST_ERROR=None)
             app.config["WARM"].update(done=True, error=None)
