@@ -2,161 +2,202 @@ import os
 import json
 import threading
 from io import BytesIO
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import pandas as pd
 import joblib
 
-# Optional import; only needed when using blob storage
+# --------------------------------------------
+# Optional Azure Blob dependency
+# --------------------------------------------
 try:
-    from azure.storage.blob import BlobClient
+    from azure.storage.blob import BlobClient  # type: ignore
     HAS_AZURE = True
 except Exception:
     HAS_AZURE = False
 
 
-# --------------------------
-# Helpers: Blob download
-# --------------------------
-def download_blob_bytes(
+# --------------------------------------------
+# Helpers
+# --------------------------------------------
+def _download_blob_bytes(
     *,
-    blob_url: Optional[str] = None,
-    account_url: Optional[str] = None,
-    container: Optional[str] = None,
-    blob_name: Optional[str] = None,
-    sas_token: Optional[str] = None,
-    connection_string: Optional[str] = None,
+    connection_string: str,
+    container: str,
+    blob_name: str,
 ) -> bytes:
     if not HAS_AZURE:
-        raise RuntimeError("azure-storage-blob not installed")
-
-    if blob_url:
-        client = BlobClient.from_blob_url(blob_url)
-    elif connection_string:
-        if not (container and blob_name):
-            raise ValueError("container and blob_name required with connection_string")
-        client = BlobClient.from_connection_string(
-            conn_str=connection_string, container_name=container, blob_name=blob_name
-        )
-    else:
-        if not (account_url and container and blob_name and sas_token):
-            raise ValueError("account_url, container, blob_name, sas_token are required")
-        client = BlobClient(
-            account_url=account_url, container_name=container, blob_name=blob_name, credential=sas_token
-        )
+        raise RuntimeError("azure-storage-blob is not installed")
+    client = BlobClient.from_connection_string(
+        conn_str=connection_string,
+        container_name=container,
+        blob_name=blob_name,
+    )
     return client.download_blob().readall()
 
 
-# --------------------------
-# App Factory
-# --------------------------
+def _build_store_cache(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Try to derive a list of stores from the dataframe.
+
+    Priorities:
+      1) a single column named like 'store', 'store_id', 'store_number', 'store_num'
+      2) fallback: any columns containing 'store' (treat as names)
+    """
+    if df is None or df.empty:
+        return []
+
+    store_col = None
+    for c in df.columns:
+        cl = c.lower()
+        if cl in ("store", "store_id", "store_number", "store_num"):
+            store_col = c
+            break
+
+    if store_col:
+        vals = (
+            pd.Series(df[store_col])
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        vals = sorted(vals)
+        return [{"id": v, "name": f"Store {v}"} for v in vals[:5000]]
+
+    candidates = [c for c in df.columns if "store" in c.lower()]
+    return [{"id": c, "name": c.replace("_", " ").title()} for c in candidates[:5000]]
+
+
+# --------------------------------------------
+# App factory
+# --------------------------------------------
 def create_app() -> Flask:
+    """
+    Environment variables (Blob mode, optional):
+      - AZURE_STORAGE_CONNECTION_STRING
+      - AZURE_STORAGE_CONTAINER      (e.g., 'artifacts')
+      - MODEL_BLOB_NAME              (default 'model.pkl')
+      - FEATURES_BLOB_NAME           (default 'features.csv')
+      - STORES_BLOB_NAME             (default 'stores.json', optional)
+
+    Local mode (if files exist in the deployed site root):
+      - MODEL_PATH                   (default 'backend/models/model.pkl')
+      - FEATURES_PATH                (default 'backend/data/features.csv')
+
+    Behavior:
+      * If local files exist -> load them.
+      * Else, if Blob vars are present -> download & load.
+      * Else -> start OK with no model/data (health shows ok; /api/forecast returns 503).
+    """
     app = Flask(__name__)
     CORS(app)
 
     # Runtime state
     app.config.update(
-        MODEL=None,
-        FEATURES_DF=None,
-        STORE_LIST_CACHE=[],   # [{"id": "...", "name": "..."}]
-        STATUS="starting",     # starting | warming | ok | error
-        LAST_ERROR=None,
+        MODEL=None,                  # Any fitted object (joblib)
+        FEATURES_DF=pd.DataFrame(),  # DataFrame or empty
+        STORE_LIST_CACHE=[],         # [{"id": "...", "name": "..."}]
+        STATUS="starting",           # starting | warming | ok | error
+        LAST_ERROR=None,             # str | None
         WARM=dict(started=False, done=False, error=None),
     )
 
-    # Local dev paths
+    # Local paths (relative to site root by default)
     local_model_path = os.getenv("MODEL_PATH", "backend/models/model.pkl")
     local_features_path = os.getenv("FEATURES_PATH", "backend/data/features.csv")
 
-    # Connection string mode (preferred)
-    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    blob_container = os.getenv("AZURE_STORAGE_CONTAINER") or os.getenv("BLOB_CONTAINER")
+    # Blob config
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    blob_container = os.getenv("AZURE_STORAGE_CONTAINER", "").strip()
 
-    # Blob names
-    model_blob = os.getenv("MODEL_BLOB_NAME") or os.getenv("MODEL_BLOB") or "model.pkl"
-    features_blob = os.getenv("FEATURES_BLOB_NAME") or os.getenv("FEATURES_BLOB") or "features.csv"
-    stores_blob = os.getenv("STORES_BLOB_NAME", "stores.json")  # optional tiny file
+    model_blob = os.getenv("MODEL_BLOB_NAME", "model.pkl").strip()
+    features_blob = os.getenv("FEATURES_BLOB_NAME", "features.csv").strip()
+    stores_blob = os.getenv("STORES_BLOB_NAME", "stores.json").strip()
 
-    # Optional quick fallback while warming
+    # Optional quick fallback for stores
     try:
-        FALLBACK_STORES: List[str] = json.loads(os.getenv("FALLBACK_STORES_JSON", "[]"))
+        FALLBACK_STORES = json.loads(os.getenv("FALLBACK_STORES_JSON", "[]"))
+        if not isinstance(FALLBACK_STORES, list):
+            FALLBACK_STORES = []
     except Exception:
         FALLBACK_STORES = []
 
-    def _download_from_conn(blob_name: str) -> bytes:
-        if not (conn_str and blob_container):
-            raise RuntimeError("Connection string mode requires AZURE_STORAGE_CONNECTION_STRING and container")
-        return download_blob_bytes(connection_string=conn_str, container=blob_container, blob_name=blob_name)
+    def _blob_configured() -> bool:
+        return bool(conn_str and blob_container)
 
-    def _build_store_cache(df: pd.DataFrame) -> List[Dict[str, Any]]:
-        store_col = None
-        for c in df.columns:
-            if c.lower() in ("store", "store_id", "store_number", "store_num"):
-                store_col = c
-                break
-        if store_col:
-            vals = pd.Series(df[store_col]).dropna().astype(str).unique().tolist()
-            vals = sorted(vals)
-            return [{"id": v, "name": f"Store {v}"} for v in vals[:5000]]
-        # fallback: columns that look like one-hots
-        candidates = [c for c in df.columns if "store" in c.lower()]
-        return [{"id": c, "name": c.replace("_", " ").title()} for c in candidates]
-
-    def _try_load_stores_json() -> List[Dict[str, Any]]:
-        """Fast path: tiny stores.json in the same container, [{"id":"2327","name":"Store 2327"}, ...]."""
+    def _try_load_stores_json_from_blob() -> List[Dict[str, Any]]:
+        """Fast path: small stores.json in the same container."""
+        if not _blob_configured():
+            return []
         try:
-            b = _download_from_conn(stores_blob)
-            lst = json.loads(b.decode("utf-8"))
-            # Accept either ["2327","2200"] or [{"id":"2327","name":"Store 2327"}, ...]
-            if lst and isinstance(lst[0], str):
-                return [{"id": s, "name": f"Store {s}"} for s in lst]
-            if lst and isinstance(lst[0], dict) and "id" in lst[0]:
-                return lst
+            b = _download_blob_bytes(
+                connection_string=conn_str,
+                container=blob_container,
+                blob_name=stores_blob,
+            )
+            data = json.loads(b.decode("utf-8"))
+            if isinstance(data, list) and data:
+                if isinstance(data[0], str):
+                    return [{"id": s, "name": f"Store {s}"} for s in data]
+                if isinstance(data[0], dict) and "id" in data[0]:
+                    return data
         except Exception:
             pass
         return []
 
+    # --------------------------
+    # Warm-up loader (background)
+    # --------------------------
     def warm_start():
+        if app.config["WARM"]["started"]:
+            return
         app.config["WARM"]["started"] = True
         app.config["STATUS"] = "warming"
-        app.logger.info("Warm-up: starting (container=%s)", blob_container)
+        app.logger.info("Warm-up: starting (blob_container=%s)", blob_container or "<none>")
 
         try:
-            # Only try stores.json if Blob is fully configured
-            if conn_str and blob_container:
-                try:
-                    quick_stores = _try_load_stores_json()
-                    if quick_stores:
-                        app.config["STORE_LIST_CACHE"] = quick_stores
-                        app.logger.info("Warm-up: primed store cache from stores.json (%d)", len(quick_stores))
-                except Exception:
-                    pass
+            # Seed store list ASAP from Blob stores.json (if configured/present)
+            if _blob_configured():
+                quick_stores = _try_load_stores_json_from_blob()
+                if quick_stores:
+                    app.config["STORE_LIST_CACHE"] = quick_stores
+                    app.logger.info("Warm-up: primed store cache from stores.json (%d)", len(quick_stores))
 
             model = None
             df = None
 
-            # Prefer local artifacts
+            # 1) Prefer local artifacts if both exist
             if os.path.exists(local_model_path) and os.path.exists(local_features_path):
                 app.logger.info("Warm-up: loading local artifacts")
                 model = joblib.load(local_model_path)
                 df = pd.read_csv(local_features_path, low_memory=False)
 
-            # Else Blob, but only if fully configured
-            elif conn_str and blob_container:
+            # 2) Else try Blob (if configured)
+            elif _blob_configured():
                 if not HAS_AZURE:
-                    raise RuntimeError("azure-storage-blob not installed but Blob config provided")
+                    raise RuntimeError("Blob config provided but 'azure-storage-blob' is not installed")
                 app.logger.info("Warm-up: downloading artifacts from Blob container '%s'", blob_container)
-                model_bytes = _download_from_conn(model_blob)
-                feat_bytes = _download_from_conn(features_blob)
+                model_bytes = _download_blob_bytes(
+                    connection_string=conn_str,
+                    container=blob_container,
+                    blob_name=model_blob,
+                )
+                feat_bytes = _download_blob_bytes(
+                    connection_string=conn_str,
+                    container=blob_container,
+                    blob_name=features_blob,
+                )
                 model = joblib.load(BytesIO(model_bytes))
                 df = pd.read_csv(BytesIO(feat_bytes), low_memory=False)
 
-            # Else: start healthy with no model/data
+            # 3) Else start OK with no model/data
             else:
-                app.logger.info("Warm-up: no local artifacts and no storage configured; starting without model/data")
-                app.config.update(MODEL=None, FEATURES_DF=pd.DataFrame(), STATUS="ok", LAST_ERROR=None)
+                app.logger.info("Warm-up: no local artifacts and no Blob config; starting without model/data")
+                app.config.update(MODEL=None, FEATURES_DF=pd.DataFrame())
+                app.config.update(STATUS="ok", LAST_ERROR=None)
                 app.config["WARM"].update(done=True, error=None)
                 return
 
@@ -173,7 +214,14 @@ def create_app() -> Flask:
             app.config["WARM"].update(done=True, error=str(e))
             app.logger.exception("Warm-up failed")
 
+    # Kick it off once at import
+    threading.Thread(target=warm_start, daemon=True).start()
 
+    # If a worker recycles later and lost state, ensure warmup restarts automatically
+    @app.before_request
+    def _ensure_warm():
+        if not app.config["WARM"]["started"]:
+            threading.Thread(target=warm_start, daemon=True).start()
 
     # --------------------------
     # Routes
@@ -199,19 +247,19 @@ def create_app() -> Flask:
 
     @app.get("/api/stores")
     def stores():
-        # 1) Serve cache if available (instant)
+        # 1) Serve cache if available
         cache = app.config.get("STORE_LIST_CACHE") or []
         if cache:
             return jsonify({"source": "cache", "stores": cache}), 200
 
-        # 2) If features already loaded, compute once and cache (still reasonably fast)
+        # 2) If features already loaded, compute once and cache
         df = app.config.get("FEATURES_DF")
-        if isinstance(df, pd.DataFrame):
+        if isinstance(df, pd.DataFrame) and not df.empty:
             cache = _build_store_cache(df)
             app.config["STORE_LIST_CACHE"] = cache
             return jsonify({"source": "computed", "stores": cache}), 200
 
-        # 3) Warming: return quick fallback, never block
+        # 3) Warming: return fallback list (if provided) but never block
         if FALLBACK_STORES:
             return jsonify({
                 "source": "fallback",
@@ -223,13 +271,14 @@ def create_app() -> Flask:
 
     @app.post("/api/forecast")
     def forecast():
+        # Example stub — replace with your model’s feature engineering & predict
         if app.config.get("MODEL") is None:
             err = app.config.get("LAST_ERROR")
             msg = f"Model not ready{' - ' + err if err else ''}"
             return jsonify({"error": msg, "status": app.config.get("STATUS")}), 503
 
         payload = request.get_json(silent=True) or {}
-        # TODO: transform payload -> feature vector(s) for your model
+        # TODO: transform payload -> feature vector(s), then call app.config["MODEL"].predict(...)
         return jsonify({"ok": True, "received": payload}), 200
 
     @app.get("/")
@@ -242,5 +291,6 @@ def create_app() -> Flask:
 app = create_app()
 
 if __name__ == "__main__":
+    # For local dev; on Azure, Gunicorn will use app:app
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
