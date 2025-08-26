@@ -38,27 +38,24 @@ def _download_blob_bytes(
     return client.download_blob().readall()
 
 
-def _build_store_cache(df: pd.DataFrame) -> List[Dict[str, Any]]:
+def _build_store_cache(df: pd.DataFrame, *, store_id_column: Optional[str]) -> List[Dict[str, Any]]:
     """
-    Try to derive a list of stores from the dataframe.
+    Build a list of stores from the dataframe.
 
-    Priorities:
-      1) a single column named like 'store', 'store_id', 'store_number', 'store_num'
-      2) fallback: any columns containing 'store' (treat as names)
+    Priority:
+      1) If STORE_ID_COLUMN is provided (and exists), use it.
+      2) else a single column named exactly one of:
+         'store', 'store_id', 'store_number', 'store_num'
+      3) else fallback to columns containing 'store', but IGNORE obvious
+         aggregates/stat columns like mean/std/avg/min/max/median/etc.
     """
     if df is None or df.empty:
         return []
 
-    store_col = None
-    for c in df.columns:
-        cl = c.lower()
-        if cl in ("store", "store_id", "store_number", "store_num"):
-            store_col = c
-            break
-
-    if store_col:
+    # 1) Explicit column via env
+    if store_id_column and store_id_column in df.columns:
         vals = (
-            pd.Series(df[store_col])
+            pd.Series(df[store_id_column])
             .dropna()
             .astype(str)
             .unique()
@@ -67,7 +64,28 @@ def _build_store_cache(df: pd.DataFrame) -> List[Dict[str, Any]]:
         vals = sorted(vals)
         return [{"id": v, "name": f"Store {v}"} for v in vals[:5000]]
 
-    candidates = [c for c in df.columns if "store" in c.lower()]
+    # 2) Common id column names
+    for c in df.columns:
+        cl = c.lower()
+        if cl in ("store", "store_id", "store_number", "store_num"):
+            vals = (
+                pd.Series(df[c])
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+            vals = sorted(vals)
+            return [{"id": v, "name": f"Store {v}"} for v in vals[:5000]]
+
+    # 3) Fallback: any column containing 'store' but skip typical aggregate/stat columns
+    skip_tokens = ("mean", "std", "avg", "median", "min", "max", "sum", "count", "rate", "pct", "percent")
+    candidates = [
+        c for c in df.columns
+        if "store" in c.lower() and not any(tok in c.lower() for tok in skip_tokens)
+    ]
+
+    # In fallback mode we return column names (schema hints) rather than IDs
     return [{"id": c, "name": c.replace("_", " ").title()} for c in candidates[:5000]]
 
 
@@ -86,6 +104,9 @@ def create_app() -> Flask:
     Local mode (if files exist in the deployed site root):
       - MODEL_PATH                   (default 'backend/models/model.pkl')
       - FEATURES_PATH                (default 'backend/data/features.csv')
+
+    Store ID selection:
+      - STORE_ID_COLUMN              (exact header for the store id column, e.g. 'Store Number')
 
     Behavior:
       * If local files exist -> load them.
@@ -116,6 +137,9 @@ def create_app() -> Flask:
     model_blob = os.getenv("MODEL_BLOB_NAME", "model.pkl").strip()
     features_blob = os.getenv("FEATURES_BLOB_NAME", "features.csv").strip()
     stores_blob = os.getenv("STORES_BLOB_NAME", "stores.json").strip()
+
+    # Store id column (explicit)
+    store_id_column = os.getenv("STORE_ID_COLUMN")
 
     # Optional quick fallback for stores
     try:
@@ -156,7 +180,10 @@ def create_app() -> Flask:
             return
         app.config["WARM"]["started"] = True
         app.config["STATUS"] = "warming"
-        app.logger.info("Warm-up: starting (blob_container=%s)", blob_container or "<none>")
+        app.logger.info(
+            "Warm-up: starting | blob_container=%s | store_id_column=%s",
+            blob_container or "<none>", store_id_column or "<auto>"
+        )
 
         try:
             # Seed store list ASAP from Blob stores.json (if configured/present)
@@ -203,7 +230,7 @@ def create_app() -> Flask:
 
             # Build store list if not already set
             if not app.config.get("STORE_LIST_CACHE"):
-                app.config["STORE_LIST_CACHE"] = _build_store_cache(df)
+                app.config["STORE_LIST_CACHE"] = _build_store_cache(df, store_id_column=store_id_column)
 
             app.config.update(MODEL=model, FEATURES_DF=df, STATUS="ok", LAST_ERROR=None)
             app.config["WARM"].update(done=True, error=None)
@@ -255,7 +282,7 @@ def create_app() -> Flask:
         # 2) If features already loaded, compute once and cache
         df = app.config.get("FEATURES_DF")
         if isinstance(df, pd.DataFrame) and not df.empty:
-            cache = _build_store_cache(df)
+            cache = _build_store_cache(df, store_id_column=store_id_column)
             app.config["STORE_LIST_CACHE"] = cache
             return jsonify({"source": "computed", "stores": cache}), 200
 
@@ -278,7 +305,7 @@ def create_app() -> Flask:
             return jsonify({"error": msg, "status": app.config.get("STATUS")}), 503
 
         payload = request.get_json(silent=True) or {}
-        # TODO: transform payload -> feature vector(s), then call app.config["MODEL"].predict(...)
+        # TODO: transform payload -> features, then call app.config["MODEL"].predict(...)
         return jsonify({"ok": True, "received": payload}), 200
 
     @app.get("/")
