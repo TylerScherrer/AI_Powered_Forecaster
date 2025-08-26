@@ -118,52 +118,59 @@ def create_app() -> Flask:
             pass
         return []
 
-    # --------------------------
-    # Background warm-up
-    # --------------------------
     def warm_start():
         app.config["WARM"]["started"] = True
         app.config["STATUS"] = "warming"
         app.logger.info("Warm-up: starting (container=%s)", blob_container)
 
         try:
-            # 0) Quick win: load tiny stores.json first (if present)
+            # 0) Prime store list fast if a tiny stores.json exists in Blob
             quick_stores = _try_load_stores_json()
             if quick_stores:
                 app.config["STORE_LIST_CACHE"] = quick_stores
                 app.logger.info("Warm-up: primed store cache from stores.json (%d)", len(quick_stores))
 
-            # 1) Local artifacts
+            model: Any = None
+            df: pd.DataFrame | None = None
+
+            # 1) Prefer local artifacts if they exist (works without any Azure config)
             if os.path.exists(local_model_path) and os.path.exists(local_features_path):
                 app.logger.info("Warm-up: loading local artifacts")
                 model = joblib.load(local_model_path)
                 df = pd.read_csv(local_features_path, low_memory=False)
-            else:
-                # 2) From blob storage via connection string
-                if not HAS_AZURE:
-                    raise RuntimeError("azure-storage-blob not installed and local files not found")
-                app.logger.info("Warm-up: downloading model and features")
-                model_bytes = _download_from_conn(model_blob)
-                feat_bytes = _download_from_conn(features_blob)
-                model = joblib.load(BytesIO(model_bytes))
-                df = pd.read_csv(BytesIO(feat_bytes), low_memory=False)
 
-            # 3) Build store cache if not already primed
-            if not app.config["STORE_LIST_CACHE"]:
+            else:
+                # 2) If local files are missing, use Blob only when fully configured
+                if conn_str and blob_container:
+                    if not HAS_AZURE:
+                        raise RuntimeError("azure-storage-blob not installed but Blob config provided")
+                    app.logger.info("Warm-up: downloading artifacts from Blob container '%s'", blob_container)
+                    model_bytes = _download_from_conn(model_blob)
+                    feat_bytes = _download_from_conn(features_blob)
+                    model = joblib.load(BytesIO(model_bytes))
+                    df = pd.read_csv(BytesIO(feat_bytes), low_memory=False)
+                else:
+                    # 3) No local files and no Blob config -> start without model/data (still healthy)
+                    app.logger.info("Warm-up: no local artifacts and no storage configured; starting without model/data")
+                    app.config.update(MODEL=None, FEATURES_DF=pd.DataFrame(), STATUS="ok", LAST_ERROR=None)
+                    app.config["WARM"].update(done=True, error=None)
+                    return
+
+            # 4) Build store cache if we haven't already (e.g., no stores.json)
+            if not app.config.get("STORE_LIST_CACHE"):
                 store_cache = _build_store_cache(df)
                 app.config["STORE_LIST_CACHE"] = store_cache
 
-            # 4) Publish artifacts
+            # 5) Publish artifacts and finish
             app.config.update(MODEL=model, FEATURES_DF=df, STATUS="ok", LAST_ERROR=None)
             app.config["WARM"].update(done=True, error=None)
             app.logger.info("Warm-up: done (stores_cached=%d)", len(app.config["STORE_LIST_CACHE"]))
+
         except Exception as e:
             app.config.update(STATUS="error", LAST_ERROR=str(e))
             app.config["WARM"].update(done=True, error=str(e))
             app.logger.exception("Warm-up failed")
 
-    # Start warm-up in the background
-    threading.Thread(target=warm_start, daemon=True).start()
 
     # --------------------------
     # Routes
