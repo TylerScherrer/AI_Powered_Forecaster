@@ -6,4 +6,4 @@ numpy
 scikit-learn
 joblib
 xgboost
-azure-storage-blob
+azure-storage-blob>=12.19
