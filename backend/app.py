@@ -1,3 +1,4 @@
+# app.py
 import os
 import json
 import threading
@@ -9,9 +10,9 @@ from flask_cors import CORS
 import pandas as pd
 import joblib
 
-# --------------------------------------------
+# ------------------------------------------------------------
 # Optional Azure Blob dependency
-# --------------------------------------------
+# ------------------------------------------------------------
 try:
     from azure.storage.blob import BlobClient  # type: ignore
     HAS_AZURE = True
@@ -19,43 +20,66 @@ except Exception:
     HAS_AZURE = False
 
 
-# --------------------------------------------
-# Helpers
-# --------------------------------------------
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+def _norm(s: str) -> str:
+    """normalize a column name (lowercase, spaces->underscores)."""
+    return str(s).strip().lower().replace(" ", "_")
+
 def _download_blob_bytes(
-    *,
-    connection_string: str,
-    container: str,
-    blob_name: str,
+    *, connection_string: str, container: str, blob_name: str
 ) -> bytes:
     if not HAS_AZURE:
         raise RuntimeError("azure-storage-blob is not installed")
     client = BlobClient.from_connection_string(
-        conn_str=connection_string,
-        container_name=container,
-        blob_name=blob_name,
+        conn_str=connection_string, container_name=container, blob_name=blob_name
     )
     return client.download_blob().readall()
 
-
-def _build_store_cache(df: pd.DataFrame, *, store_id_column: Optional[str]) -> List[Dict[str, Any]]:
+def _resolve_store_column(df: pd.DataFrame) -> Optional[str]:
     """
-    Build a list of stores from the dataframe.
-
+    Decide which column to use for store IDs.
     Priority:
-      1) If STORE_ID_COLUMN is provided (and exists), use it.
-      2) else a single column named exactly one of:
-         'store', 'store_id', 'store_number', 'store_num'
-      3) else fallback to columns containing 'store', but IGNORE obvious
-         aggregates/stat columns like mean/std/avg/min/max/median/etc.
+      1) explicit env var STORE_ID_COLUMN (case/space-insensitive)
+      2) common names: store, store_id, store_number, store_num
+    """
+    if df is None or df.empty:
+        return None
+
+    cols = list(df.columns)
+    norm_map = {_norm(c): c for c in cols}
+
+    override = os.getenv("STORE_ID_COLUMN", "").strip()
+    if override:
+        key = _norm(override)
+        if key in norm_map:
+            return norm_map[key]
+
+    for candidate in ("store", "store_id", "store_number", "store_num"):
+        if candidate in norm_map:
+            return norm_map[candidate]
+
+    # If nothing obvious, but we have exactly one 'store' substring column, use it
+    candidates = [c for c in cols if "store" in _norm(c)]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+def _build_store_cache(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Build [{id,name}] from the chosen store column; otherwise fall back to any
+    columns that contain 'store'.
     """
     if df is None or df.empty:
         return []
 
-    # 1) Explicit column via env
-    if store_id_column and store_id_column in df.columns:
+    store_col = _resolve_store_column(df)
+    if store_col:
         vals = (
-            pd.Series(df[store_id_column])
+            pd.Series(df[store_col])
             .dropna()
             .astype(str)
             .unique()
@@ -64,54 +88,20 @@ def _build_store_cache(df: pd.DataFrame, *, store_id_column: Optional[str]) -> L
         vals = sorted(vals)
         return [{"id": v, "name": f"Store {v}"} for v in vals[:5000]]
 
-    # 2) Common id column names
-    for c in df.columns:
-        cl = c.lower()
-        if cl in ("store", "store_id", "store_number", "store_num"):
-            vals = (
-                pd.Series(df[c])
-                .dropna()
-                .astype(str)
-                .unique()
-                .tolist()
-            )
-            vals = sorted(vals)
-            return [{"id": v, "name": f"Store {v}"} for v in vals[:5000]]
-
-    # 3) Fallback: any column containing 'store' but skip typical aggregate/stat columns
-    skip_tokens = ("mean", "std", "avg", "median", "min", "max", "sum", "count", "rate", "pct", "percent")
-    candidates = [
-        c for c in df.columns
-        if "store" in c.lower() and not any(tok in c.lower() for tok in skip_tokens)
-    ]
-
-    # In fallback mode we return column names (schema hints) rather than IDs
+    # Fallback: show any columns that *look* store-related
+    candidates = [c for c in df.columns if "store" in _norm(c)]
     return [{"id": c, "name": c.replace("_", " ").title()} for c in candidates[:5000]]
 
 
-# --------------------------------------------
+# ------------------------------------------------------------
 # App factory
-# --------------------------------------------
+# ------------------------------------------------------------
 def create_app() -> Flask:
     """
-    Environment variables (Blob mode, optional):
-      - AZURE_STORAGE_CONNECTION_STRING
-      - AZURE_STORAGE_CONTAINER      (e.g., 'artifacts')
-      - MODEL_BLOB_NAME              (default 'model.pkl')
-      - FEATURES_BLOB_NAME           (default 'features.csv')
-      - STORES_BLOB_NAME             (default 'stores.json', optional)
-
-    Local mode (if files exist in the deployed site root):
-      - MODEL_PATH                   (default 'backend/models/model.pkl')
-      - FEATURES_PATH                (default 'backend/data/features.csv')
-
-    Store ID selection:
-      - STORE_ID_COLUMN              (exact header for the store id column, e.g. 'Store Number')
-
     Behavior:
       * If local files exist -> load them.
       * Else, if Blob vars are present -> download & load.
-      * Else -> start OK with no model/data (health shows ok; /api/forecast returns 503).
+      * Else -> start OK with no model/data; health shows ok and /api/forecast returns 503.
     """
     app = Flask(__name__)
     CORS(app)
@@ -126,22 +116,31 @@ def create_app() -> Flask:
         WARM=dict(started=False, done=False, error=None),
     )
 
-    # Local paths (relative to site root by default)
-    local_model_path = os.getenv("MODEL_PATH", "backend/models/model.pkl")
-    local_features_path = os.getenv("FEATURES_PATH", "backend/data/features.csv")
+    # ---------- Local paths (relative to app root by default)
+    local_model_path = os.getenv("MODEL_PATH", os.path.join("backend", "models", "model.pkl"))
+    local_features_path = os.getenv("FEATURES_PATH", os.path.join("backend", "data", "features.csv"))
 
-    # Blob config
+    # Also consider same-folder simple names if present
+    local_model_candidates = [
+        os.path.join(APP_ROOT, local_model_path),
+        os.path.join(APP_ROOT, "model.pkl"),
+    ]
+    local_features_candidates = [
+        os.path.join(APP_ROOT, local_features_path),
+        os.path.join(APP_ROOT, "features.csv"),
+    ]
+
+    # ---------- Blob config
     conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
     blob_container = os.getenv("AZURE_STORAGE_CONTAINER", "").strip()
-
     model_blob = os.getenv("MODEL_BLOB_NAME", "model.pkl").strip()
     features_blob = os.getenv("FEATURES_BLOB_NAME", "features.csv").strip()
     stores_blob = os.getenv("STORES_BLOB_NAME", "stores.json").strip()
 
-    # Store id column (explicit)
-    store_id_column = os.getenv("STORE_ID_COLUMN")
+    def blob_configured() -> bool:
+        return bool(conn_str and blob_container)
 
-    # Optional quick fallback for stores
+    # ---------- Optional fallback for /api/stores while warming
     try:
         FALLBACK_STORES = json.loads(os.getenv("FALLBACK_STORES_JSON", "[]"))
         if not isinstance(FALLBACK_STORES, list):
@@ -149,12 +148,8 @@ def create_app() -> Flask:
     except Exception:
         FALLBACK_STORES = []
 
-    def _blob_configured() -> bool:
-        return bool(conn_str and blob_container)
-
     def _try_load_stores_json_from_blob() -> List[Dict[str, Any]]:
-        """Fast path: small stores.json in the same container."""
-        if not _blob_configured():
+        if not blob_configured():
             return []
         try:
             b = _download_blob_bytes(
@@ -172,22 +167,19 @@ def create_app() -> Flask:
             pass
         return []
 
-    # --------------------------
-    # Warm-up loader (background)
-    # --------------------------
+    # --------------------------------------------------------
+    # Warm-up: run once in background so startup is quick
+    # --------------------------------------------------------
     def warm_start():
         if app.config["WARM"]["started"]:
             return
         app.config["WARM"]["started"] = True
         app.config["STATUS"] = "warming"
-        app.logger.info(
-            "Warm-up: starting | blob_container=%s | store_id_column=%s",
-            blob_container or "<none>", store_id_column or "<auto>"
-        )
+        app.logger.info("Warm-up: starting (blob_container=%s)", blob_container or "<none>")
 
         try:
-            # Seed store list ASAP from Blob stores.json (if configured/present)
-            if _blob_configured():
+            # Seed cache quickly from stores.json in Blob (if any)
+            if blob_configured():
                 quick_stores = _try_load_stores_json_from_blob()
                 if quick_stores:
                     app.config["STORE_LIST_CACHE"] = quick_stores
@@ -196,31 +188,30 @@ def create_app() -> Flask:
             model = None
             df = None
 
-            # 1) Prefer local artifacts if both exist
-            if os.path.exists(local_model_path) and os.path.exists(local_features_path):
-                app.logger.info("Warm-up: loading local artifacts")
-                model = joblib.load(local_model_path)
-                df = pd.read_csv(local_features_path, low_memory=False)
+            # 1) Prefer local artifacts (if both exist)
+            lm = next((p for p in local_model_candidates if os.path.exists(p)), None)
+            lf = next((p for p in local_features_candidates if os.path.exists(p)), None)
+
+            if lm and lf:
+                app.logger.info("Warm-up: loading local artifacts (model=%s, features=%s)", lm, lf)
+                model = joblib.load(lm)
+                df = pd.read_csv(lf, low_memory=False)
 
             # 2) Else try Blob (if configured)
-            elif _blob_configured():
+            elif blob_configured():
                 if not HAS_AZURE:
                     raise RuntimeError("Blob config provided but 'azure-storage-blob' is not installed")
                 app.logger.info("Warm-up: downloading artifacts from Blob container '%s'", blob_container)
                 model_bytes = _download_blob_bytes(
-                    connection_string=conn_str,
-                    container=blob_container,
-                    blob_name=model_blob,
+                    connection_string=conn_str, container=blob_container, blob_name=model_blob
                 )
                 feat_bytes = _download_blob_bytes(
-                    connection_string=conn_str,
-                    container=blob_container,
-                    blob_name=features_blob,
+                    connection_string=conn_str, container=blob_container, blob_name=features_blob
                 )
                 model = joblib.load(BytesIO(model_bytes))
                 df = pd.read_csv(BytesIO(feat_bytes), low_memory=False)
 
-            # 3) Else start OK with no model/data
+            # 3) Else: start OK with no model/data
             else:
                 app.logger.info("Warm-up: no local artifacts and no Blob config; starting without model/data")
                 app.config.update(MODEL=None, FEATURES_DF=pd.DataFrame())
@@ -228,14 +219,13 @@ def create_app() -> Flask:
                 app.config["WARM"].update(done=True, error=None)
                 return
 
-            # Build store list if not already set
-            # Build/override store list from CSV once it's loaded
-            computed = _build_store_cache(df, store_id_column=store_id_column)
-            if computed:
-                app.config["STORE_LIST_CACHE"] = computed
+            # Build store cache
+            app.config["FEATURES_DF"] = df
+            app.config["MODEL"] = model
+            if not app.config.get("STORE_LIST_CACHE"):
+                app.config["STORE_LIST_CACHE"] = _build_store_cache(df)
 
-
-            app.config.update(MODEL=model, FEATURES_DF=df, STATUS="ok", LAST_ERROR=None)
+            app.config.update(STATUS="ok", LAST_ERROR=None)
             app.config["WARM"].update(done=True, error=None)
             app.logger.info("Warm-up: done (stores_cached=%d)", len(app.config["STORE_LIST_CACHE"]))
 
@@ -253,9 +243,9 @@ def create_app() -> Flask:
         if not app.config["WARM"]["started"]:
             threading.Thread(target=warm_start, daemon=True).start()
 
-    # --------------------------
+    # --------------------------------------------------------
     # Routes
-    # --------------------------
+    # --------------------------------------------------------
     @app.get("/api/health")
     def health():
         warm = app.config["WARM"]
@@ -285,7 +275,7 @@ def create_app() -> Flask:
         # 2) If features already loaded, compute once and cache
         df = app.config.get("FEATURES_DF")
         if isinstance(df, pd.DataFrame) and not df.empty:
-            cache = _build_store_cache(df, store_id_column=store_id_column)
+            cache = _build_store_cache(df)
             app.config["STORE_LIST_CACHE"] = cache
             return jsonify({"source": "computed", "stores": cache}), 200
 
@@ -308,8 +298,15 @@ def create_app() -> Flask:
             return jsonify({"error": msg, "status": app.config.get("STATUS")}), 503
 
         payload = request.get_json(silent=True) or {}
-        # TODO: transform payload -> features, then call app.config["MODEL"].predict(...)
+        # TODO: transform payload -> feature vector(s) and call model.predict(...)
         return jsonify({"ok": True, "received": payload}), 200
+
+    @app.get("/api/debug/columns")
+    def debug_columns():
+        df = app.config.get("FEATURES_DF")
+        cols = [str(c) for c in getattr(df, "columns", [])]
+        chosen = _resolve_store_column(df) if isinstance(df, pd.DataFrame) else None
+        return jsonify(columns=cols, chosen_store_column=chosen), 200
 
     @app.get("/")
     def root():
@@ -321,6 +318,6 @@ def create_app() -> Flask:
 app = create_app()
 
 if __name__ == "__main__":
-    # For local dev; on Azure, Gunicorn will use app:app
+    # For local dev; on Azure, Gunicorn uses 'app:app'
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
