@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
+import ForecastChart from "./components/ForecastChart";
 
-/** Build the API base once, with sensible fallbacks. */
+/** Build the API base once, with sensible fallbacks. (NO hooks here) */
 function buildApiBase() {
   // Prefer VITE_API_BASE; keep backward compat with VITE_API_URL
   const rawEnv =
@@ -8,9 +9,9 @@ function buildApiBase() {
       import.meta.env.VITE_API_URL ||
       "").toString().trim();
 
-  // optional runtime override if you ever set window.API_BASE in index.html
+  // Optional runtime override if you ever set window.API_BASE in index.html
   const runtime =
-    (typeof window !== "undefined" && window.API_BASE) ? window.API_BASE : "";
+    typeof window !== "undefined" && window.API_BASE ? window.API_BASE : "";
 
   const picked = (runtime || rawEnv).replace(/\/+$/, ""); // drop trailing '/'
 
@@ -32,12 +33,19 @@ async function getJSON(path) {
 }
 
 export default function App() {
+  // ---------- original app state ----------
   const [stores, setStores] = useState([]);
   const [selectedStore, setSelectedStore] = useState("");
   const [debugOut, setDebugOut] = useState("");
   const [healthMsg, setHealthMsg] = useState("loading…");
   const [loadingStores, setLoadingStores] = useState(true);
   const [storesError, setStoresError] = useState("");
+
+  // ---------- forecasting state (moved out of buildApiBase) ----------
+  const [history, setHistory] = useState([]);
+  const [forecast, setForecast] = useState([]);
+  const [forecastStatus, setForecastStatus] = useState("idle"); // idle|loading|ready|error
+  const [forecastErr, setForecastErr] = useState("");
 
   // Fallback only if API fails/returns empty
   const fallbackStores = useMemo(
@@ -49,6 +57,7 @@ export default function App() {
     []
   );
 
+  // Fetch health + stores
   useEffect(() => {
     // health
     getJSON("/health")
@@ -76,6 +85,58 @@ export default function App() {
       })
       .finally(() => setLoadingStores(false));
   }, [fallbackStores]);
+
+  // Fetch forecast when a store is selected
+  // replace your current forecast useEffect with this version
+useEffect(() => {
+  if (!selectedStore) return;
+
+  let cancelled = false;
+  setForecastStatus("loading");
+  setForecastErr("");
+
+  (async () => {
+    try {
+      const url = `${API_BASE}/forecast`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ store_id: selectedStore }),
+      });
+
+      if (!res.ok) {
+        // e.g., 503 Model not ready, or other error
+        const msg = `${res.status} ${res.statusText}`;
+        throw new Error(msg);
+      }
+
+      const data = await res.json();
+
+      // Accept the current stub shape { ok: true, received: {...} }
+      // and normalize future real shape { history: [...], forecast: [...] }
+      const h = Array.isArray(data?.history) ? data.history : [];
+      const f = Array.isArray(data?.forecast) ? data.forecast : [];
+
+      if (!cancelled) {
+        setHistory(h);
+        setForecast(f);
+        setForecastStatus("ready");
+        // Optional: show what the server echoed for debugging
+        console.log("forecast payload received:", data);
+      }
+    } catch (err) {
+      if (!cancelled) {
+        setForecastErr(err.message || String(err));
+        setForecastStatus("error");
+      }
+    }
+  })();
+
+  return () => { cancelled = true; };
+}, [selectedStore]);
+
+
+
 
   // Use a real backend route: /api/debug/columns
   const callDebug = async () => {
@@ -115,6 +176,18 @@ export default function App() {
           Test /debug/columns
         </button>
       </div>
+
+      {selectedStore && (
+        <>
+          {forecastStatus === "loading" && <p>Loading forecast…</p>}
+          {forecastStatus === "error" && (
+            <p style={{ color: "#b00" }}>Failed to load forecast: {forecastErr}</p>
+          )}
+          {(forecastStatus === "ready" || forecastStatus === "idle") && (
+            <ForecastChart history={history} forecast={forecast} />
+          )}
+        </>
+      )}
 
       {storesError && (
         <p style={{ color: "#b00", marginTop: 8 }}>

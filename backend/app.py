@@ -4,11 +4,12 @@ import json
 import threading
 from io import BytesIO
 from typing import Optional, List, Dict, Any
-
+import datetime as _dt
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import pandas as pd
 import joblib
+from math import isfinite
 
 # ------------------------------------------------------------
 # Optional Azure Blob dependency
@@ -19,15 +20,74 @@ try:
 except Exception:
     HAS_AZURE = False
 
-
 # ------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+def _pick_cols(df: pd.DataFrame):
+    """Pick (store_col, date_col, y_col) using env overrides first, then heuristics."""
+    if df is None or df.empty:
+        return None, None, None
+
+    # Env overrides (optional)
+    store_override = os.getenv("STORE_ID_COLUMN", "").strip()
+    date_override  = os.getenv("DATE_COLUMN", "").strip()
+    y_override     = os.getenv("TARGET_COLUMN", "").strip()
+
+    store_col = _resolve_store_column(df)
+    if store_override and store_override in df.columns:
+        store_col = store_override
+
+    # heuristics for date / target
+    norm = lambda c: str(c).strip().lower().replace(" ", "_")
+    candidates_date = {"date", "ds", "month", "period", "order_date", "txn_date"}
+    candidates_y    = {"total", "sales", "y", "target", "revenue", "amount", "qty", "units"}
+
+    date_col = next((c for c in df.columns if norm(c) in candidates_date), None)
+    y_col    = next((c for c in df.columns if norm(c) in candidates_y), None)
+
+    if date_override and date_override in df.columns:
+        date_col = date_override
+    if y_override and y_override in df.columns:
+        y_col = y_override
+
+    return store_col, date_col, y_col
+
+
+def _monthly_history_for_store(df: pd.DataFrame, store_col: str, date_col: str, y_col: str, store_id: str):
+    """Return history rows [{date:'YYYY-MM', total: float}, ...] for a store, aggregated monthly."""
+    sdf = df[df[store_col].astype(str) == str(store_id)].copy()
+    if sdf.empty:
+        return []
+
+    # normalize date -> month start
+    sdf[date_col] = pd.to_datetime(sdf[date_col], errors="coerce")
+    sdf = sdf.dropna(subset=[date_col, y_col])
+
+    # if y_col isn't numeric, try to coerce
+    sdf[y_col] = pd.to_numeric(sdf[y_col], errors="coerce")
+    sdf = sdf.dropna(subset=[y_col])
+
+    # monthly aggregation (sum; change to 'mean' if appropriate)
+    m = (
+        sdf.set_index(date_col)
+           .groupby(pd.Grouper(freq="MS"))[y_col]
+           .sum()
+           .dropna()
+           .rename("total")
+           .reset_index()
+    )
+
+    # map to simple shape
+    m["date"] = m[date_col].dt.strftime("%Y-%m")
+    hist = [{"date": r["date"], "total": float(r["total"])} for _, r in m.iterrows()]
+    return hist
+
 def _norm(s: str) -> str:
     """normalize a column name (lowercase, spaces->underscores)."""
     return str(s).strip().lower().replace(" ", "_")
+
 
 def _download_blob_bytes(
     *, connection_string: str, container: str, blob_name: str
@@ -39,12 +99,14 @@ def _download_blob_bytes(
     )
     return client.download_blob().readall()
 
+
 def _resolve_store_column(df: pd.DataFrame) -> Optional[str]:
     """
     Decide which column to use for store IDs.
     Priority:
       1) explicit env var STORE_ID_COLUMN (case/space-insensitive)
       2) common names: store, store_id, store_number, store_num
+      3) if exactly one column contains 'store', use it
     """
     if df is None or df.empty:
         return None
@@ -62,11 +124,11 @@ def _resolve_store_column(df: pd.DataFrame) -> Optional[str]:
         if candidate in norm_map:
             return norm_map[candidate]
 
-    # If nothing obvious, but we have exactly one 'store' substring column, use it
     candidates = [c for c in cols if "store" in _norm(c)]
     if len(candidates) == 1:
         return candidates[0]
     return None
+
 
 def _build_store_cache(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
@@ -88,7 +150,6 @@ def _build_store_cache(df: pd.DataFrame) -> List[Dict[str, Any]]:
         vals = sorted(vals)
         return [{"id": v, "name": f"Store {v}"} for v in vals[:5000]]
 
-    # Fallback: show any columns that *look* store-related
     candidates = [c for c in df.columns if "store" in _norm(c)]
     return [{"id": c, "name": c.replace("_", " ").title()} for c in candidates[:5000]]
 
@@ -101,7 +162,7 @@ def create_app() -> Flask:
     Behavior:
       * If local files exist -> load them.
       * Else, if Blob vars are present -> download & load.
-      * Else -> start OK with no model/data; health shows ok and /api/forecast returns 503.
+      * Else -> start OK with no model/data; health shows ok and endpoints still respond.
     """
     app = Flask(__name__)
     CORS(app)
@@ -117,8 +178,8 @@ def create_app() -> Flask:
     )
 
     # ---------- Local paths (relative to app root by default)
-    local_model_path = os.getenv("MODEL_PATH", os.path.join("backend", "models", "model.pkl"))
-    local_features_path = os.getenv("FEATURES_PATH", os.path.join("backend", "data", "features.csv"))
+    local_model_path = os.getenv("MODEL_PATH", os.path.join("models", "model.pkl"))
+    local_features_path = os.getenv("FEATURES_PATH", os.path.join("data", "features.csv"))
 
     # Also consider same-folder simple names if present
     local_model_candidates = [
@@ -178,63 +239,96 @@ def create_app() -> Flask:
         app.logger.info("Warm-up: starting (blob_container=%s)", blob_container or "<none>")
 
         try:
-            # Seed cache quickly from stores.json in Blob (if any)
+            # Optional quick prime from stores.json in Blob
             if blob_configured():
-                quick_stores = _try_load_stores_json_from_blob()
-                if quick_stores:
-                    app.config["STORE_LIST_CACHE"] = quick_stores
-                    app.logger.info("Warm-up: primed store cache from stores.json (%d)", len(quick_stores))
+                try:
+                    quick_stores = _try_load_stores_json_from_blob()
+                    if quick_stores:
+                        app.config["STORE_LIST_CACHE"] = quick_stores
+                        app.logger.info(
+                            "Warm-up: primed store cache from stores.json (%d)",
+                            len(quick_stores),
+                        )
+                except Exception:
+                    pass
 
             model = None
             df = None
 
-            # 1) Prefer local artifacts (if both exist)
-            lm = next((p for p in local_model_candidates if os.path.exists(p)), None)
+            # ---- Local: allow features and/or model (features-only is OK)
             lf = next((p for p in local_features_candidates if os.path.exists(p)), None)
-
-            if lm and lf:
-                app.logger.info("Warm-up: loading local artifacts (model=%s, features=%s)", lm, lf)
-                model = joblib.load(lm)
+            if lf:
+                app.logger.info("Warm-up: loading local features %s", lf)
                 df = pd.read_csv(lf, low_memory=False)
 
-            # 2) Else try Blob (if configured)
-            elif blob_configured():
-                if not HAS_AZURE:
-                    raise RuntimeError("Blob config provided but 'azure-storage-blob' is not installed")
-                app.logger.info("Warm-up: downloading artifacts from Blob container '%s'", blob_container)
-                model_bytes = _download_blob_bytes(
-                    connection_string=conn_str, container=blob_container, blob_name=model_blob
+            lm = next((p for p in local_model_candidates if os.path.exists(p)), None)
+            if lm:
+                app.logger.info("Warm-up: loading local model %s", lm)
+                model = joblib.load(lm)
+
+            # ---- Blob fallback for anything missing
+            if df is None and blob_configured():
+                app.logger.info(
+                    "Warm-up: downloading features from Blob '%s'", features_blob
                 )
                 feat_bytes = _download_blob_bytes(
-                    connection_string=conn_str, container=blob_container, blob_name=features_blob
+                    connection_string=conn_str,
+                    container=blob_container,
+                    blob_name=features_blob,
                 )
-                model = joblib.load(BytesIO(model_bytes))
                 df = pd.read_csv(BytesIO(feat_bytes), low_memory=False)
 
-            # 3) Else: start OK with no model/data
-            else:
-                app.logger.info("Warm-up: no local artifacts and no Blob config; starting without model/data")
-                app.config.update(MODEL=None, FEATURES_DF=pd.DataFrame())
-                app.config.update(STATUS="ok", LAST_ERROR=None)
+            if model is None and blob_configured():
+                try:
+                    app.logger.info(
+                        "Warm-up: downloading model from Blob '%s'", model_blob
+                    )
+                    model_bytes = _download_blob_bytes(
+                        connection_string=conn_str,
+                        container=blob_container,
+                        blob_name=model_blob,
+                    )
+                    model = joblib.load(BytesIO(model_bytes))
+                except Exception:
+                    # OK if no model; we can still serve stores/endpoints that don't need it
+                    app.logger.info(
+                        "Warm-up: no model available; continuing without one"
+                    )
+
+            # ---- If we still have nothing, start "ok" with empty DF
+            if df is None and model is None:
+                app.logger.info(
+                    "Warm-up: no artifacts found; starting without model/data"
+                )
+                app.config.update(
+                    MODEL=None, FEATURES_DF=pd.DataFrame(), STATUS="ok", LAST_ERROR=None
+                )
                 app.config["WARM"].update(done=True, error=None)
                 return
 
-            # Build store cache
-            app.config["FEATURES_DF"] = df
-            app.config["MODEL"] = model
-            if not app.config.get("STORE_LIST_CACHE"):
+            # Build store cache if we have features
+            if isinstance(df, pd.DataFrame) and not df.empty and not app.config.get(
+                "STORE_LIST_CACHE"
+            ):
                 app.config["STORE_LIST_CACHE"] = _build_store_cache(df)
 
-            app.config.update(STATUS="ok", LAST_ERROR=None)
+            app.config.update(
+                MODEL=model,
+                FEATURES_DF=(df if df is not None else pd.DataFrame()),
+                STATUS="ok",
+                LAST_ERROR=None,
+            )
             app.config["WARM"].update(done=True, error=None)
-            app.logger.info("Warm-up: done (stores_cached=%d)", len(app.config["STORE_LIST_CACHE"]))
-
+            app.logger.info(
+                "Warm-up: done (stores_cached=%d)",
+                len(app.config["STORE_LIST_CACHE"]),
+            )
         except Exception as e:
             app.config.update(STATUS="error", LAST_ERROR=str(e))
             app.config["WARM"].update(done=True, error=str(e))
             app.logger.exception("Warm-up failed")
 
-    # Kick it off once at import
+    # Kick the warm-up once at import so /api/stores is ready soon
     threading.Thread(target=warm_start, daemon=True).start()
 
     # If a worker recycles later and lost state, ensure warmup restarts automatically
@@ -258,12 +352,15 @@ def create_app() -> Flask:
         else:
             status = "starting"
 
-        return jsonify(
-            service="backend",
-            status=status,
-            last_error=app.config.get("LAST_ERROR"),
-            stores_cached=len(app.config.get("STORE_LIST_CACHE", [])),
-        ), 200
+        return (
+            jsonify(
+                service="backend",
+                status=status,
+                last_error=app.config.get("LAST_ERROR"),
+                stores_cached=len(app.config.get("STORE_LIST_CACHE", [])),
+            ),
+            200,
+        )
 
     @app.get("/api/stores")
     def stores():
@@ -280,26 +377,123 @@ def create_app() -> Flask:
             return jsonify({"source": "computed", "stores": cache}), 200
 
         # 3) Warming: return fallback list (if provided) but never block
-        if FALLBACK_STORES:
-            return jsonify({
-                "source": "fallback",
-                "status": "warming",
-                "stores": [{"id": s, "name": f"Store {s}"} for s in FALLBACK_STORES]
-            }), 200
+        try:
+            fallback = FALLBACK_STORES
+        except NameError:
+            fallback = []
+        if fallback:
+            return (
+                jsonify(
+                    {
+                        "source": "fallback",
+                        "status": "warming",
+                        "stores": [{"id": s, "name": f"Store {s}"} for s in fallback],
+                    }
+                ),
+                200,
+            )
 
         return jsonify({"source": "warming", "stores": []}), 200
 
-    @app.post("/api/forecast")
-    def forecast():
-        # Example stub — replace with your model’s feature engineering & predict
-        if app.config.get("MODEL") is None:
-            err = app.config.get("LAST_ERROR")
-            msg = f"Model not ready{' - ' + err if err else ''}"
-            return jsonify({"error": msg, "status": app.config.get("STATUS")}), 503
+    # ---- SINGLE FORECAST ROUTE (always returns a response)
 
+
+    @app.route("/api/forecast", methods=["POST"], endpoint="api_forecast")
+    def api_forecast():
+        """
+        POST JSON: { "store_id": "<id>", "horizon": 6 }
+        Returns: { "store_id", "history": [...], "forecast": [...] }
+        Uses FEATURES_DF; tries MODEL if available; otherwise naive seasonal/MA forecast.
+        """
         payload = request.get_json(silent=True) or {}
-        # TODO: transform payload -> feature vector(s) and call model.predict(...)
-        return jsonify({"ok": True, "received": payload}), 200
+        store_id = str(payload.get("store_id", "")).strip()
+        horizon  = int(payload.get("horizon", 6))  # months to forecast
+
+        df = app.config.get("FEATURES_DF")
+        model = app.config.get("MODEL")
+
+        # 1) Pick columns and build monthly history
+        sc, dc, yc = _pick_cols(df if isinstance(df, pd.DataFrame) else pd.DataFrame())
+        if not (isinstance(df, pd.DataFrame) and not df.empty and sc and dc and yc and store_id):
+            # fall back to deterministic stub if we can't build history yet
+            base = 1000 + (abs(hash(store_id)) % 250)
+            history = [
+                {"date": "2023-01", "total": base},
+                {"date": "2023-02", "total": int(base * 1.05)},
+                {"date": "2023-03", "total": int(base * 0.98)},
+            ]
+            forecast_pts = [
+                {"date": "2023-04", "total": int(history[-1]["total"] * 1.03)},
+                {"date": "2023-05", "total": int(history[-1]["total"] * 1.06)},
+            ][:horizon]
+            return jsonify({"store_id": store_id, "history": history, "forecast": forecast_pts}), 200
+
+        history = _monthly_history_for_store(df, sc, dc, yc, store_id)
+        if not history:
+            # no rows for that store
+            return jsonify({"store_id": store_id, "history": [], "forecast": []}), 200
+
+        # 2) Try MODEL if present (best-effort; keep it defensive)
+        #    Expecting a regressor-like object with .predict(X_future)
+        #    You'll need to adapt 'build_features_for_future' to your pipeline.
+        try:
+            if model is not None:
+                # --- Example: build features for the next `horizon` months ---
+                last_hist = pd.to_datetime(history[-1]["date"] + "-01")
+                future_dates = [(last_hist + pd.DateOffset(months=i)).strftime("%Y-%m") 
+                                for i in range(1, horizon + 1)]
+
+                # This assumes you trained your model on rows from FEATURES_DF
+                # with columns in app.config["MODEL_FEATURES"]
+                feature_cols = getattr(model, "feature_names_in_", app.config.get("MODEL_FEATURES", []))
+                if not feature_cols:
+                    return jsonify({"error": "Model has no feature_names_in_"}), 500
+
+                # Build feature DataFrame for the future horizon
+                # TODO: adapt this to your real feature engineering
+                X_future = pd.DataFrame([{
+                    "Lag_1": history[-1]["total"],
+                    "Lag_2": history[-2]["total"] if len(history) > 1 else history[-1]["total"],
+                    "Lag_3": history[-3]["total"] if len(history) > 2 else history[-1]["total"],
+                    "Month": int(d.split("-")[1]),
+                    "Quarter": (int(d.split("-")[1]) - 1) // 3 + 1,
+                } for d in future_dates])
+
+                # Keep only model’s expected columns
+                X_future = X_future[[c for c in feature_cols if c in X_future.columns]]
+
+                yhat = model.predict(X_future)
+                forecast_pts = [{"date": d, "total": float(v)} for d, v in zip(future_dates, yhat)]
+                return jsonify({"store_id": store_id, "history": history, "forecast": forecast_pts}), 200
+
+        except Exception as e:
+            app.logger.warning("MODEL predict failed; falling back to naive forecast: %s", e)
+
+        # 3) Naive seasonal / moving-average fallback (no extra deps)
+        #    - If we have >= 12 months, use last year's same-month (seasonal naive)
+        #    - Else use simple rolling average of last 3 months
+        totals = [float(h["total"]) for h in history if isfinite(float(h["total"]))]
+        # figure the last month as timestamp
+        last_month = pd.to_datetime(history[-1]["date"] + "-01")
+        dates = [(last_month + pd.DateOffset(months=i)).strftime("%Y-%m") for i in range(1, horizon + 1)]
+
+        if len(totals) >= 12:
+            # seasonal naive: y_{t+h} = y_{t-12+h}
+            season_ref = totals[-12:]
+            forecast_vals = [(season_ref[h % 12]) for h in range(horizon)]
+            # small drift to avoid perfectly flat lines
+            scale = totals[-1] / max(1e-9, season_ref[-1])
+            forecast_vals = [float(v) * float(scale) for v in forecast_vals]
+        else:
+            # rolling average of last k (k=3 or len available)
+            k = 3 if len(totals) >= 3 else max(1, len(totals))
+            avg = sum(totals[-k:]) / k
+            # gentle growth 1%/mo just to visualize trend
+            forecast_vals = [avg * (1.01 ** i) for i in range(1, horizon + 1)]
+
+        forecast_pts = [{"date": d, "total": float(v)} for d, v in zip(dates, forecast_vals)]
+        return jsonify({"store_id": store_id, "history": history, "forecast": forecast_pts}), 200
+
 
     @app.get("/api/debug/columns")
     def debug_columns():
