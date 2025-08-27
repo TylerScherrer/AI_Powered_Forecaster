@@ -1,51 +1,38 @@
+# .github/workflows/deploy-frontend.yml
 name: Deploy frontend to Azure Static Web Apps
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
-concurrency:
-  group: swa-frontend
-  cancel-in-progress: true
-
 jobs:
-  build-and-deploy:
+  build_and_deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      deployments: write
-
-    env:
-      # Optional: set your API base for the build if you use it
-      VITE_API_BASE: ${{ vars.VITE_API_BASE || 'https://forecasting-ai-powered-ddarbmdqe3dzdccg.canadacentral-01.azurewebsites.net/api' }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Use Node 20
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          node-version: '20'
 
-      - name: Build (Vite)
+      - name: Install deps
         working-directory: frontend
-        run: |
-          npm ci
-          npm run build
+        run: npm ci
+
+      - name: Build (inject API base for Vite)
+        working-directory: frontend
+        env:
+          # put this in a repo secret if you prefer
+          VITE_API_URL: https://forecasting-ai-powered-ddarbmdqe3dzdccg.canadacentral-01.azurewebsites.net
+        run: npm run build
 
       - name: Deploy to Azure Static Web Apps
         uses: Azure/static-web-apps-deploy@v1
         with:
-          action: upload
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
-          # We already built, so just point to the artifact
-          app_location: frontend
-          app_artifact_location: frontend/dist
-          skip_app_build: true
-          production_branch: main
+          action: upload
+          app_location: frontend/dist      # <— DEPLOY THE BUILD OUTPUT
+          skip_app_build: true             # we already built
+          skip_api_build: true
