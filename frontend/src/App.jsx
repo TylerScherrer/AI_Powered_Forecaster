@@ -1,16 +1,32 @@
 import { useEffect, useMemo, useState } from "react";
 
+/** Build the API base once, with sensible fallbacks. */
 function buildApiBase() {
-  const raw = (import.meta.env.VITE_API_URL || "").trim().replace(/\/+$/, "");
-  if (!raw) return "";                        // relative mode -> /api/*
-  return raw.endsWith("/api") ? raw : `${raw}/api`;
+  // Prefer VITE_API_BASE; keep backward compat with VITE_API_URL
+  const rawEnv =
+    (import.meta.env.VITE_API_BASE ||
+      import.meta.env.VITE_API_URL ||
+      "").toString().trim();
+
+  // optional runtime override if you ever set window.API_BASE in index.html
+  const runtime =
+    (typeof window !== "undefined" && window.API_BASE) ? window.API_BASE : "";
+
+  const picked = (runtime || rawEnv).replace(/\/+$/, ""); // drop trailing '/'
+
+  if (picked) {
+    return picked.endsWith("/api") ? picked : `${picked}/api`;
+  }
+
+  // Absolute default to your working App Service backend:
+  return "https://forecasting-ai-powered-ddarbmdqe3dzdccg.canadacentral-01.azurewebsites.net/api";
 }
 
 const API_BASE = buildApiBase();
 
 async function getJSON(path) {
   const url = `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }
@@ -18,12 +34,12 @@ async function getJSON(path) {
 export default function App() {
   const [stores, setStores] = useState([]);
   const [selectedStore, setSelectedStore] = useState("");
-  const [hello, setHello] = useState("");
+  const [debugOut, setDebugOut] = useState("");
   const [healthMsg, setHealthMsg] = useState("loading…");
   const [loadingStores, setLoadingStores] = useState(true);
   const [storesError, setStoresError] = useState("");
 
-  // Fallback used ONLY if API returns nothing
+  // Fallback only if API fails/returns empty
   const fallbackStores = useMemo(
     () => [
       { id: "001", name: "Store 001" },
@@ -49,13 +65,11 @@ export default function App() {
           setStores(list);
           setSelectedStore(list[0].id);
         } else {
-          // API returned empty -> use fallback ONCE
           setStores(fallbackStores);
           setSelectedStore(fallbackStores[0].id);
         }
       })
       .catch((e) => {
-        // API failed -> use fallback
         setStoresError(e.message);
         setStores(fallbackStores);
         setSelectedStore(fallbackStores[0].id);
@@ -63,22 +77,20 @@ export default function App() {
       .finally(() => setLoadingStores(false));
   }, [fallbackStores]);
 
-  const callHello = async () => {
+  // Use a real backend route: /api/debug/columns
+  const callDebug = async () => {
     try {
-      const q = new URLSearchParams({ store: selectedStore }).toString();
-      const data = await getJSON(`/hello?${q}`);
-      setHello(data?.message ?? JSON.stringify(data));
+      const data = await getJSON(`/debug/columns`);
+      setDebugOut(JSON.stringify(data, null, 2));
     } catch (e) {
-      setHello(`error: ${e.message}`);
+      setDebugOut(`error: ${e.message}`);
     }
   };
 
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", margin: "2rem auto", maxWidth: 720 }}>
       <h1>Frontend ready</h1>
-      <p>
-        SWA → Azure API test:
-      </p>
+      <p>SWA → Azure App Service API test</p>
 
       <div style={{ padding: "1rem", border: "1px solid #ddd", borderRadius: 8, marginBottom: 16 }}>
         <strong>API health:</strong> {healthMsg}
@@ -98,8 +110,9 @@ export default function App() {
             </option>
           ))}
         </select>
-        <button onClick={callHello} disabled={!selectedStore}>
-          Test /hello
+
+        <button onClick={callDebug} disabled={!selectedStore}>
+          Test /debug/columns
         </button>
       </div>
 
@@ -109,10 +122,12 @@ export default function App() {
         </p>
       )}
 
-      <pre style={{ marginTop: 16 }}>{hello}</pre>
+      <pre style={{ marginTop: 16, background: "#f8f8f8", padding: 12, borderRadius: 6 }}>
+        {debugOut}
+      </pre>
 
       <div style={{ opacity: 0.6, marginTop: 24, fontSize: 12 }}>
-        API base: <code>{API_BASE || "(relative /api)"}</code>
+        API base: <code>{API_BASE}</code>
       </div>
     </div>
   );
