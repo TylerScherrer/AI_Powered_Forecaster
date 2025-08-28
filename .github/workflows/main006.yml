@@ -1,0 +1,29 @@
+name: Deploy backend (Flask) to Azure Web App
+
+on:
+  push:
+    paths:
+      - "backend/**"                # only run when backend changes
+      - ".github/workflows/deploy-backend.yml"
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Package the backend folder
+      - name: Zip backend
+        run: |
+          cd backend
+          zip -r ../backend.zip .
+
+      # Deploy zip to your Azure Web App (backend)
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: <YOUR_BACKEND_WEBAPP_NAME>        # e.g. forecasting-ai-powered-xxxx
+          slot-name: production
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_BACKEND }}
+          package: backend.zip
