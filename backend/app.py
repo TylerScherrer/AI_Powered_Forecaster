@@ -25,16 +25,12 @@ except Exception:
 # ------------------------------------------------------------
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 def _store_key(x) -> str:
-    """Normalize store ids so '2602.0' == '2602'."""
     s = str(x).strip()
+    # collapse numeric-looking floats: "2553.0" -> "2553"
     if s.endswith(".0"):
-        try:
-            f = float(s)
-            if f.is_integer():
-                return str(int(f))
-        except Exception:
-            pass
+        s = s[:-2]
     return s
+
 
 def _pick_cols(df: pd.DataFrame):
     """Pick (store_col, date_col, y_col) using env overrides first, then heuristics."""
@@ -66,22 +62,20 @@ def _pick_cols(df: pd.DataFrame):
     return store_col, date_col, y_col
 
 
-def _monthly_history_for_store(df: pd.DataFrame, store_col: str, date_col: str, y_col: str, store_id: str):
-    """Return history rows [{date:'YYYY-MM', total: float}, ...] for a store, aggregated monthly."""
-    key = _store_key(store_id)
-    keys = pd.Series(df[store_col]).map(_store_key)
-    sdf = df[keys == key].copy()
+def _monthly_history_for_store(df, store_col, date_col, y_col, store_id):
+    key = _store_key(store_id)  # << normalize requested id
+    sdf = df[pd.Series(df[store_col]).map(_store_key) == key].copy()
     if sdf.empty:
         return []
 
-    # robust date parsing
-    sdf[date_col] = pd.to_datetime(sdf[date_col], errors="coerce", infer_datetime_format=True)
-    sdf[date_col] = sdf[date_col].fillna(pd.to_datetime(sdf[date_col].astype(str), format="%Y-%m", errors="coerce"))
-    sdf[date_col] = sdf[date_col].fillna(pd.to_datetime(sdf[date_col].astype(str), format="%Y%m", errors="coerce"))
-
+    # more forgiving date parsing
+    dt = pd.to_datetime(sdf[date_col], errors="coerce", infer_datetime_format=True)
+    if dt.isna().any():
+        dt = dt.fillna(pd.to_datetime(sdf[date_col].astype(str), format="%Y-%m", errors="coerce"))
+        dt = dt.fillna(pd.to_datetime(sdf[date_col].astype(str), format="%Y%m", errors="coerce"))
+    sdf[date_col] = dt
     sdf = sdf.dropna(subset=[date_col, y_col])
 
-    # ensure numeric target
     sdf[y_col] = pd.to_numeric(sdf[y_col], errors="coerce")
     sdf = sdf.dropna(subset=[y_col])
 
@@ -95,6 +89,7 @@ def _monthly_history_for_store(df: pd.DataFrame, store_col: str, date_col: str, 
     )
     m["date"] = m[date_col].dt.strftime("%Y-%m")
     return [{"date": r["date"], "total": float(r["total"])} for _, r in m.iterrows()]
+
 
 
 def _norm(s: str) -> str:
@@ -144,19 +139,14 @@ def _resolve_store_column(df: pd.DataFrame) -> Optional[str]:
 
 
 def _build_store_cache(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """
-    Build [{id,name}] from the chosen store column; otherwise fall back to any
-    columns that contain 'store'.
-    """
     if df is None or df.empty:
         return []
-
     store_col = _resolve_store_column(df)
     if store_col:
         vals = (
             pd.Series(df[store_col])
             .dropna()
-            .astype(str)
+            .map(_store_key)        # << normalize
             .unique()
             .tolist()
         )
@@ -165,6 +155,7 @@ def _build_store_cache(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
     candidates = [c for c in df.columns if "store" in _norm(c)]
     return [{"id": c, "name": c.replace("_", " ").title()} for c in candidates[:5000]]
+
 
 
 # ------------------------------------------------------------
