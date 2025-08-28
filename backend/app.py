@@ -24,6 +24,17 @@ except Exception:
 # Utilities
 # ------------------------------------------------------------
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+def _store_key(x) -> str:
+    """Normalize store ids so '2602.0' == '2602'."""
+    s = str(x).strip()
+    if s.endswith(".0"):
+        try:
+            f = float(s)
+            if f.is_integer():
+                return str(int(f))
+        except Exception:
+            pass
+    return s
 
 def _pick_cols(df: pd.DataFrame):
     """Pick (store_col, date_col, y_col) using env overrides first, then heuristics."""
@@ -57,19 +68,23 @@ def _pick_cols(df: pd.DataFrame):
 
 def _monthly_history_for_store(df: pd.DataFrame, store_col: str, date_col: str, y_col: str, store_id: str):
     """Return history rows [{date:'YYYY-MM', total: float}, ...] for a store, aggregated monthly."""
-    sdf = df[df[store_col].astype(str) == str(store_id)].copy()
+    key = _store_key(store_id)
+    keys = pd.Series(df[store_col]).map(_store_key)
+    sdf = df[keys == key].copy()
     if sdf.empty:
         return []
 
-    # normalize date -> month start
-    sdf[date_col] = pd.to_datetime(sdf[date_col], errors="coerce")
+    # robust date parsing
+    sdf[date_col] = pd.to_datetime(sdf[date_col], errors="coerce", infer_datetime_format=True)
+    sdf[date_col] = sdf[date_col].fillna(pd.to_datetime(sdf[date_col].astype(str), format="%Y-%m", errors="coerce"))
+    sdf[date_col] = sdf[date_col].fillna(pd.to_datetime(sdf[date_col].astype(str), format="%Y%m", errors="coerce"))
+
     sdf = sdf.dropna(subset=[date_col, y_col])
 
-    # if y_col isn't numeric, try to coerce
+    # ensure numeric target
     sdf[y_col] = pd.to_numeric(sdf[y_col], errors="coerce")
     sdf = sdf.dropna(subset=[y_col])
 
-    # monthly aggregation (sum; change to 'mean' if appropriate)
     m = (
         sdf.set_index(date_col)
            .groupby(pd.Grouper(freq="MS"))[y_col]
@@ -78,11 +93,9 @@ def _monthly_history_for_store(df: pd.DataFrame, store_col: str, date_col: str, 
            .rename("total")
            .reset_index()
     )
-
-    # map to simple shape
     m["date"] = m[date_col].dt.strftime("%Y-%m")
-    hist = [{"date": r["date"], "total": float(r["total"])} for _, r in m.iterrows()]
-    return hist
+    return [{"date": r["date"], "total": float(r["total"])} for _, r in m.iterrows()]
+
 
 def _norm(s: str) -> str:
     """normalize a column name (lowercase, spaces->underscores)."""
