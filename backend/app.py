@@ -340,6 +340,102 @@ def create_app() -> Flask:
     # --------------------------------------------------------
     # Routes
     # --------------------------------------------------------
+    # ---------- DIAGNOSTICS (temporary endpoints) ----------
+    @app.get("/api/debug/summary")
+    def debug_summary():
+        df = app.config.get("FEATURES_DF")
+        rows = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+        cols = list(getattr(df, "columns", []))
+        sc, dc, yc = _pick_cols(df if rows else pd.DataFrame())
+
+        def dtype_map():
+            if not rows: return {}
+            return {str(c): str(df[c].dtype) for c in cols[:50]}  # trim for size
+
+        # sample store ids (raw and normalized)
+        store_samples = []
+        norm_store_samples = []
+        unique_stores = None
+        if rows and sc:
+            s = pd.Series(df[sc]).dropna().astype(str).head(10)
+            store_samples = s.tolist()
+            try:
+                norm_store_samples = s.map(_store_key).tolist()
+                unique_stores = int(pd.Series(df[sc]).map(_store_key).nunique())
+            except Exception:
+                pass
+
+        # date snapshot
+        date_min = date_max = None
+        if rows and dc:
+            try:
+                dt = pd.to_datetime(df[dc], errors="coerce")
+                date_min = str(dt.min())
+                date_max = str(dt.max())
+            except Exception:
+                pass
+
+        # target snapshot
+        target_min = target_max = None
+        if rows and yc:
+            try:
+                y = pd.to_numeric(df[yc], errors="coerce")
+                target_min = float(y.min())
+                target_max = float(y.max())
+            except Exception:
+                pass
+
+        return jsonify({
+            "status": app.config.get("STATUS"),
+            "has_model": app.config.get("MODEL") is not None,
+            "features_rows": rows,
+            "features_cols": len(cols),
+            "chosen_columns": {"store": sc, "date": dc, "target": yc},
+            "dtypes": dtype_map(),
+            "store_samples_raw": store_samples,
+            "store_samples_norm": norm_store_samples,
+            "store_unique_norm": unique_stores,
+            "date_min": date_min,
+            "date_max": date_max,
+            "target_min": target_min,
+            "target_max": target_max,
+            "stores_cached": len(app.config.get("STORE_LIST_CACHE") or []),
+        }), 200
+
+
+    @app.get("/api/debug/inspect")
+    def debug_inspect():
+        """?store_id=2602 checks row counts before/after normalization + date parse sample."""
+        store_id = request.args.get("store_id", "").strip()
+        df = app.config.get("FEATURES_DF")
+        sc, dc, yc = _pick_cols(df if isinstance(df, pd.DataFrame) else pd.DataFrame())
+
+        if not (isinstance(df, pd.DataFrame) and len(df) and sc and dc and yc and store_id):
+            return jsonify({"ok": False, "reason": "missing df/columns/store_id"}), 200
+
+        raw_match = df[df[sc].astype(str) == store_id]
+        norm_match = df[pd.Series(df[sc]).map(_store_key) == _store_key(store_id)]
+
+        # show a few dates before/after parsing
+        sample = norm_match[[sc, dc, yc]].head(5).copy()
+        try:
+            parsed = pd.to_datetime(sample[dc], errors="coerce", infer_datetime_format=True)
+            parsed2 = parsed.fillna(pd.to_datetime(sample[dc].astype(str), format="%Y-%m", errors="coerce"))
+            parsed3 = parsed2.fillna(pd.to_datetime(sample[dc].astype(str), format="%Y%m", errors="coerce"))
+            parsed_iso = [str(x) for x in parsed3]
+        except Exception:
+            parsed_iso = []
+
+        return jsonify({
+            "ok": True,
+            "store_id_query": store_id,
+            "chosen_columns": {"store": sc, "date": dc, "target": yc},
+            "raw_match_rows": int(len(raw_match)),
+            "normalized_match_rows": int(len(norm_match)),
+            "date_parse_preview": parsed_iso,
+            "sample_rows": sample.astype(str).to_dict(orient="records"),
+        }), 200
+
     @app.get("/api/health")
     def health():
         warm = app.config["WARM"]
